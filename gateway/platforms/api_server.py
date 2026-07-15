@@ -1170,6 +1170,7 @@ class _IdempotencyCache:
     def __init__(self, max_items: int = 1000, ttl_seconds: int = 300):
         from collections import OrderedDict
         self._store = OrderedDict()
+        self._fanout_claims = OrderedDict()
         self._inflight: Dict[tuple[str, str], "asyncio.Task[Any]"] = {}
         self._ttl = ttl_seconds
         self._max = max_items
@@ -1181,16 +1182,35 @@ class _IdempotencyCache:
             self._store.pop(k, None)
         while len(self._store) > self._max:
             self._store.popitem(last=False)
+        expired_claims = [
+            k for k, ts in self._fanout_claims.items() if now - ts > self._ttl
+        ]
+        for k in expired_claims:
+            self._fanout_claims.pop(k, None)
+        while len(self._fanout_claims) > self._max:
+            self._fanout_claims.popitem(last=False)
 
-    async def get_or_set(self, key: str, fingerprint: str, compute_coro):
+    def claim_fanout(self, key: str, fingerprint: str) -> bool:
+        """Atomically claim one terminal fanout for a streaming request."""
+        self._purge()
+        claim_key = (key, fingerprint)
+        if claim_key in self._fanout_claims:
+            return False
+        self._fanout_claims[claim_key] = time.time()
+        self._purge()
+        return True
+
+    async def get_or_set_with_status(self, key: str, fingerprint: str, compute_coro):
+        """Return ``(response, fresh)``; only the computing caller is fresh."""
         self._purge()
         cache_key = (key, fingerprint)
         item = self._store.get(cache_key)
         if item:
-            return item["resp"]
+            return item["resp"], False
 
         inflight_key = cache_key
         task = self._inflight.get(inflight_key)
+        fresh = task is None
         if task is None:
             async def _compute_and_store():
                 resp = await compute_coro()
@@ -1208,7 +1228,14 @@ class _IdempotencyCache:
 
             task.add_done_callback(_clear_inflight)
 
-        return await asyncio.shield(task)
+        return await asyncio.shield(task), fresh
+
+    async def get_or_set(self, key: str, fingerprint: str, compute_coro):
+        """Backward-compatible response-only wrapper."""
+        response, _fresh = await self.get_or_set_with_status(
+            key, fingerprint, compute_coro
+        )
+        return response
 
 
 _idem_cache = _IdempotencyCache()
@@ -1256,6 +1283,49 @@ def _api_idempotency_namespace(
         "session_key": gateway_session_key,
         "source": source,
     }
+def _scoped_idempotency_key(
+    *,
+    surface: str,
+    key: str,
+    gateway_session_key: Optional[str],
+    session_source: Optional["SessionSource"],
+) -> str:
+    """Scope replay state to one endpoint and trusted canonical API identity."""
+    profile = (
+        getattr(session_source, "profile", None)
+        or _api_request_profile.get()
+    )
+    identity = gateway_session_key or "api-default"
+    # NUL cannot occur in request keys and makes the components unambiguous.
+    return f"{surface}\0{profile}\0{identity}\0{key}"
+
+
+def _terminal_fanout_claim_for_request(
+    *,
+    request: Any,
+    surface: str,
+    body: Dict[str, Any],
+    fingerprint_keys: List[str],
+    gateway_session_key: Optional[str],
+    session_source: Optional["SessionSource"],
+) -> Optional[tuple[str, str]]:
+    """Build an identity-scoped terminal-delivery claim for one API request."""
+    idempotency_key = request.headers.get("Idempotency-Key")
+    if not idempotency_key:
+        return None
+    return (
+        _scoped_idempotency_key(
+            surface=surface,
+            key=idempotency_key,
+            gateway_session_key=gateway_session_key,
+            session_source=session_source,
+        ),
+        _make_request_fingerprint(
+            body,
+            keys=fingerprint_keys,
+            namespace=_api_idempotency_namespace(gateway_session_key, session_source),
+        ),
+    )
 
 
 def _derive_chat_session_id(
@@ -1426,6 +1496,11 @@ class APIServerAdapter(BasePlatformAdapter):
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
+        # Installed by GatewayRunner.  The API adapter deliberately receives a
+        # resolved SessionSource, never an HTTP-supplied delivery target.
+        self._final_response_fanout_handler = None
+        self._fanout_tasks: set["asyncio.Task"] = set()
+        self._preserve_fanout_during_cancel = False
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
         # Last-known-good resolved model per session (keyed by gateway_session_key
         # ONLY — never session_id, which rotates/is ephemeral for one-off API
@@ -1441,6 +1516,9 @@ class APIServerAdapter(BasePlatformAdapter):
         # the cap. Bounds CPU / memory / upstream-LLM-quota exhaustion
         # from a request flood (#7483).
         self._max_concurrent_runs: int = self._resolve_max_concurrent_runs()
+        # Number of requests admitted by the auth/drain wrapper but not yet
+        # handed off to the per-surface agent/task bookkeeping.
+        self._pending_agent_requests: int = 0
         # Number of in-flight runs on the non-streaming chat/responses paths
         # (the /v1/runs path tracks its own in-flight set via
         # _active_run_tasks).
@@ -1449,10 +1527,76 @@ class APIServerAdapter(BasePlatformAdapter):
         # so /api/platforms/{platform}/events can resolve sibling adapters.
         # BasePlatformAdapter declares the class-level default of None.
         self.gateway_runner: Optional[Any] = None
-        # Requests admitted before their handler reaches agent bookkeeping.
-        # Shutdown counts this reservation so the request cannot slip through
-        # the drain between its first await and _run_agent()/task registration.
-        self._pending_agent_requests: int = 0
+
+    def set_final_response_fanout_handler(self, handler) -> None:
+        """Install the gateway lifecycle seam for completed API turns."""
+        self._final_response_fanout_handler = handler
+
+    async def cancel_background_tasks(self) -> None:
+        """Cancel ordinary API work while preserving fanout for disconnect drain."""
+        fanout_tasks = getattr(self, "_fanout_tasks", None)
+        if not isinstance(fanout_tasks, set):
+            fanout_tasks = set()
+            self._fanout_tasks = fanout_tasks
+        background_tasks = getattr(self, "_background_tasks", None)
+        if not isinstance(background_tasks, set):
+            # Legacy tests and embedding seams may construct the adapter with
+            # ``__new__``.  There is no initialized base task registry to drain,
+            # but optional fanout state must still make teardown a safe no-op.
+            self._preserve_fanout_during_cancel = False
+            return
+        self._preserve_fanout_during_cancel = True
+        for task in fanout_tasks:
+            background_tasks.discard(task)
+        try:
+            await super().cancel_background_tasks()
+        finally:
+            background_tasks.update(
+                task for task in fanout_tasks if not task.done()
+            )
+            self._preserve_fanout_during_cancel = False
+
+    async def _fanout_completed_api_turn(
+        self,
+        *,
+        session_source: Optional["SessionSource"],
+        response_text: Any,
+        surface: str,
+    ) -> None:
+        """Best-effort post-success delivery; it must not alter API success."""
+        if session_source is None:
+            return
+        text = str(response_text or "")
+        if not text.strip():
+            return
+        handler = self._final_response_fanout_handler
+        if handler is None:
+            return
+        async def _deliver() -> None:
+            try:
+                result = handler(session_source=session_source, content=text, surface=surface)
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception:
+                logger.exception(
+                    "[api_server] final-response fanout failed surface=%s platform=%s chat=%s",
+                    surface, getattr(session_source.platform, "value", session_source.platform), session_source.chat_id,
+                )
+
+        # Delivery is explicitly asynchronous so an offline chat adapter cannot
+        # delay, fail, or replay the already-successful HTTP/SSE response.
+        task = asyncio.create_task(_deliver())
+        fanout_tasks = getattr(self, "_fanout_tasks", None)
+        if not isinstance(fanout_tasks, set):
+            fanout_tasks = set()
+            self._fanout_tasks = fanout_tasks
+        fanout_tasks.add(task)
+        task.add_done_callback(fanout_tasks.discard)
+        background_tasks = getattr(self, "_background_tasks", None)
+        if isinstance(background_tasks, set):
+            task.add_done_callback(background_tasks.discard)
+            if not getattr(self, "_preserve_fanout_during_cancel", False):
+                background_tasks.add(task)
 
     def active_agent_work_count(self) -> int:
         """Return all live agent work owned by this API adapter.
@@ -1465,11 +1609,94 @@ class APIServerAdapter(BasePlatformAdapter):
         try:
             return (
                 int(getattr(self, "_pending_agent_requests", 0))
-                + int(self._inflight_agent_runs)
-                + sum(not task.done() for task in self._active_run_tasks.values())
+                + int(getattr(self, "_inflight_agent_runs", 0))
+                + sum(
+                    not task.done()
+                    for task in getattr(self, "_active_run_tasks", {}).values()
+                )
+                + sum(
+                    not task.done()
+                    for task in getattr(self, "_fanout_tasks", ())
+                )
             )
         except Exception:
             return 0
+
+    def _cancel_final_response_fanout_now(self) -> tuple["asyncio.Task", ...]:
+        """Signal fanout cancellation once without awaiting task cleanup.
+
+        GatewayRunner uses this at its hard disconnect deadline.  The detached
+        ``disconnect()`` coroutine remains the sole reaper; checking
+        ``Task.cancelling()`` prevents its cleanup path from injecting a second
+        cancellation into a coroutine that is already unwinding.
+        """
+        tasks = tuple(
+            task
+            for task in getattr(self, "_fanout_tasks", ())
+            if not task.done()
+        )
+        for task in tasks:
+            if task.cancelling() == 0:
+                task.cancel()
+        return tasks
+
+    async def _drain_final_response_fanout(self, timeout: float = 5.0) -> None:
+        """Bounded adapter-local drain for delivery tasks during disconnect."""
+        tasks = [
+            task
+            for task in getattr(self, "_fanout_tasks", ())
+            if not task.done()
+        ]
+        if not tasks:
+            return
+
+        async def _cancel_and_reap(pending_tasks, *, grace: float) -> None:
+            for task in pending_tasks:
+                if not task.done() and task.cancelling() == 0:
+                    task.cancel()
+            # Always yield once so ordinary cancellation handlers can finish.
+            # Runner-timeout cleanup uses zero grace and must not overrun the
+            # outer adapter deadline; normal disconnect retains a short grace.
+            await asyncio.sleep(0)
+            done = {task for task in pending_tasks if task.done()}
+            still_pending = set(pending_tasks) - done
+            if still_pending and grace > 0:
+                newly_done, still_pending = await asyncio.wait(
+                    still_pending, timeout=grace
+                )
+                done.update(newly_done)
+            if done:
+                await asyncio.gather(*done, return_exceptions=True)
+            if still_pending:
+                logger.warning(
+                    "[%s] %d cancelled fanout task(s) are still unwinding",
+                    self.name,
+                    len(still_pending),
+                )
+
+        # A runner-level timeout has already signalled cancellation. Reap tasks
+        # that finish on the next loop turn without extending the runner's hard
+        # deadline; cancellation-resistant stragglers remain tracked until their
+        # done callbacks consume them.
+        if timeout <= 0:
+            await _cancel_and_reap(tasks, grace=0)
+            return
+
+        try:
+            done, pending = await asyncio.wait(tasks, timeout=timeout)
+        except asyncio.CancelledError:
+            await _cancel_and_reap(tasks, grace=0)
+            raise
+
+        if done:
+            await asyncio.gather(*done, return_exceptions=True)
+        if pending:
+            logger.warning(
+                "[%s] Timed out draining %d final-response fanout task(s)",
+                self.name,
+                len(pending),
+            )
+            await _cancel_and_reap(pending, grace=0.5)
 
     @staticmethod
     def _gateway_is_draining() -> bool:
@@ -3649,6 +3876,14 @@ class APIServerAdapter(BasePlatformAdapter):
             if selection_error:
                 return web.json_response(_openai_error(selection_error), status=400)
         history = await self._conversation_history_for_session(session_id)
+        fanout_claim = _terminal_fanout_claim_for_request(
+            request=request,
+            surface="session_chat",
+            body=body,
+            fingerprint_keys=["message", "input", "content", "system_message", "instructions"],
+            gateway_session_key=gateway_session_key,
+            session_source=session_source,
+        )
         result, usage = await self._run_agent(
             user_message=user_message,
             conversation_history=history,
@@ -3664,7 +3899,22 @@ class APIServerAdapter(BasePlatformAdapter):
             session_source=session_source,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
-        final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
+        fanout_response = result.get("final_response", "") if isinstance(result, dict) else ""
+        final_response = _resolve_media_to_data_urls(fanout_response)
+        if (
+            isinstance(result, dict)
+            and result.get("completed", True)
+            and not result.get("failed")
+            and not result.get("partial")
+            and bool(str(fanout_response).strip())
+            and (
+                fanout_claim is None
+                or _idem_cache.claim_fanout(*fanout_claim)
+            )
+        ):
+            await self._fanout_completed_api_turn(
+                session_source=session_source, response_text=fanout_response, surface="session_chat",
+            )
         headers = {"X-Hermes-Session-Id": effective_session_id or session_id}
         if gateway_session_key:
             headers["X-Hermes-Session-Key"] = gateway_session_key
@@ -3764,6 +4014,14 @@ class APIServerAdapter(BasePlatformAdapter):
             route_source=runtime_request.get("route_source") or "global",
             model_lock=("accepted" if lock_active else ""),
         )
+        fanout_claim = _terminal_fanout_claim_for_request(
+            request=request,
+            surface="session_chat",
+            body=body,
+            fingerprint_keys=["message", "input", "content", "system_message", "instructions"],
+            gateway_session_key=gateway_session_key,
+            session_source=session_source,
+        )
 
         loop = asyncio.get_running_loop()
         queue: "asyncio.Queue[Optional[tuple[str, Dict[str, Any]]]]" = asyncio.Queue()
@@ -3829,8 +4087,23 @@ class APIServerAdapter(BasePlatformAdapter):
                     **agent_overrides,
                     session_source=session_source,
                 )
-                final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
+                fanout_response = result.get("final_response", "") if isinstance(result, dict) else ""
+                final_response = _resolve_media_to_data_urls(fanout_response)
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
+                if (
+                    isinstance(result, dict)
+                    and result.get("completed", True)
+                    and not result.get("failed")
+                    and not result.get("partial")
+                    and bool(str(fanout_response).strip())
+                    and (
+                        fanout_claim is None
+                        or _idem_cache.claim_fanout(*fanout_claim)
+                    )
+                ):
+                    await self._fanout_completed_api_turn(
+                        session_source=session_source, response_text=fanout_response, surface="session_chat_stream",
+                    )
                 turn_messages = self._turn_transcript_messages(history, user_message, result) if isinstance(result, dict) else []
                 effective_runtime = {}
                 if isinstance(result, dict):
@@ -4101,6 +4374,27 @@ class APIServerAdapter(BasePlatformAdapter):
         if selection_error:
             return web.json_response(_openai_error(selection_error), status=400)
 
+        idempotency_key = request.headers.get("Idempotency-Key")
+        idempotency_fingerprint = (
+            _make_request_fingerprint(
+                body,
+                keys=["model", "provider", "model_options", "messages", "tools", "tool_choice", "stream"],
+                namespace=_api_idempotency_namespace(gateway_session_key, session_source),
+            )
+            if idempotency_key
+            else None
+        )
+        idempotency_cache_key = (
+            _scoped_idempotency_key(
+                surface="chat_completions",
+                key=idempotency_key,
+                gateway_session_key=gateway_session_key,
+                session_source=session_source,
+            )
+            if idempotency_key
+            else None
+        )
+
         if stream:
             import queue as _q
             _stream_q: _q.Queue = _q.Queue()
@@ -4194,7 +4488,12 @@ class APIServerAdapter(BasePlatformAdapter):
             return await self._write_sse_chat_completion(
                 request, completion_id, model_name, created, _stream_q,
                 agent_task, agent_ref, session_id=session_id,
-                gateway_session_key=gateway_session_key,
+                gateway_session_key=gateway_session_key, session_source=session_source,
+                fanout_claim=(
+                    (idempotency_cache_key, idempotency_fingerprint)
+                    if idempotency_cache_key and idempotency_fingerprint
+                    else None
+                ),
             )
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
@@ -4210,18 +4509,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 route=route,
             )
 
-        idempotency_key = request.headers.get("Idempotency-Key")
+        should_fanout = True
         if idempotency_key:
-            fp = _make_request_fingerprint(
-                body,
-                keys=["model", "provider", "model_options", "messages", "tools", "tool_choice", "stream"],
-                namespace=_api_idempotency_namespace(
-                    gateway_session_key,
-                    session_source,
-                ),
-            )
+            assert idempotency_fingerprint is not None
+            assert idempotency_cache_key is not None
             try:
-                result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
+                (result, usage), should_fanout = await _idem_cache.get_or_set_with_status(
+                    idempotency_cache_key, idempotency_fingerprint, _compute_completion
+                )
             except Exception as e:
                 logger.error("Error running agent for chat completions: %s", e, exc_info=True)
                 return web.json_response(
@@ -4238,7 +4533,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=500,
                 )
 
-        final_response = _resolve_media_to_data_urls(result.get("final_response") or "")
+        fanout_response = result.get("final_response") or ""
+        final_response = _resolve_media_to_data_urls(fanout_response)
         is_partial = bool(result.get("partial"))
         is_failed = bool(result.get("failed"))
         completed = bool(result.get("completed", True))
@@ -4316,12 +4612,19 @@ class APIServerAdapter(BasePlatformAdapter):
             if err_msg:
                 response_headers["X-Hermes-Error"] = _redact_api_error_text(err_msg, limit=200)
 
+        if should_fanout and completed and not is_failed and not is_partial:
+            await self._fanout_completed_api_turn(
+                session_source=session_source, response_text=fanout_response, surface="chat_completions",
+            )
+
         return web.json_response(response_data, headers=response_headers)
 
     async def _write_sse_chat_completion(
         self, request: "web.Request", completion_id: str, model: str,
         created: int, stream_q, agent_task, agent_ref=None, session_id: str = None,
-        gateway_session_key: str = None,
+        gateway_session_key: Optional[str] = None,
+        session_source: Optional["SessionSource"] = None,
+        fanout_claim: Optional[tuple[str, str]] = None,
     ) -> "web.StreamResponse":
         """Write real streaming SSE from agent's stream_delta_callback queue.
 
@@ -4478,6 +4781,22 @@ class APIServerAdapter(BasePlatformAdapter):
                 }
             await response.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
             await response.write(b"data: [DONE]\n\n")
+            fanout_text = result.get("final_response", "") if isinstance(result, dict) else ""
+            if (
+                isinstance(result, dict)
+                and result.get("completed", True)
+                and not result.get("failed")
+                and not result.get("partial")
+                and str(fanout_text).strip()
+                and (
+                    fanout_claim is None
+                    or _idem_cache.claim_fanout(*fanout_claim)
+                )
+            ):
+                await self._fanout_completed_api_turn(
+                    session_source=session_source, response_text=fanout_text,
+                    surface="chat_completions",
+                )
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
             # Client disconnected mid-stream.  Interrupt the agent so it
             # stops making LLM API calls at the next loop iteration, then
@@ -4531,6 +4850,8 @@ class APIServerAdapter(BasePlatformAdapter):
         store: bool,
         session_id: str,
         gateway_session_key: Optional[str] = None,
+        session_source: Optional["SessionSource"] = None,
+        fanout_claim: Optional[tuple[str, str]] = None,
     ) -> "web.StreamResponse":
         """Write an SSE stream for POST /v1/responses (OpenAI Responses API).
 
@@ -4620,6 +4941,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return env
 
         final_response_text = ""
+        result: Dict[str, Any] = {}
         agent_error: Optional[str] = None
         usage: Dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
         terminal_snapshot_persisted = False
@@ -5057,6 +5379,22 @@ class APIServerAdapter(BasePlatformAdapter):
                     "type": "response.completed",
                     "response": completed_env,
                 })
+                if (
+                    isinstance(result, dict)
+                    and result.get("completed", True)
+                    and not result.get("failed")
+                    and not result.get("partial")
+                    and str(final_response_text).strip()
+                    and (
+                        fanout_claim is None
+                        or _idem_cache.claim_fanout(*fanout_claim)
+                    )
+                ):
+                    await self._fanout_completed_api_turn(
+                        session_source=session_source,
+                        response_text=final_response_text,
+                        surface="responses",
+                    )
 
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
             _persist_incomplete_if_needed()
@@ -5254,6 +5592,29 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         if selection_error:
             return web.json_response(_openai_error(selection_error), status=400)
+        idempotency_key = request.headers.get("Idempotency-Key")
+        idempotency_fingerprint = (
+            _make_request_fingerprint(
+                body,
+                keys=[
+                    "input", "instructions", "previous_response_id",
+                    "conversation", "model", "provider", "model_options", "tools", "stream",
+                ],
+                namespace=_api_idempotency_namespace(gateway_session_key, session_source),
+            )
+            if idempotency_key
+            else None
+        )
+        idempotency_cache_key = (
+            _scoped_idempotency_key(
+                surface="responses",
+                key=idempotency_key,
+                gateway_session_key=gateway_session_key,
+                session_source=session_source,
+            )
+            if idempotency_key
+            else None
+        )
         if stream:
             # Streaming branch — emit OpenAI Responses SSE events as the
             # agent runs so frontends can render text deltas and tool
@@ -5333,6 +5694,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 store=store,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                session_source=session_source,
+                fanout_claim=(
+                    (idempotency_cache_key, idempotency_fingerprint)
+                    if idempotency_cache_key and idempotency_fingerprint
+                    else None
+                ),
             )
 
         async def _compute_response():
@@ -5347,27 +5714,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 route=route,
             )
 
-        idempotency_key = request.headers.get("Idempotency-Key")
+        should_fanout = True
         if idempotency_key:
-            fp = _make_request_fingerprint(
-                body,
-                keys=[
-                    "input",
-                    "instructions",
-                    "previous_response_id",
-                    "conversation",
-                    "model",
-                    "provider",
-                    "model_options",
-                    "tools",
-                ],
-                namespace=_api_idempotency_namespace(
-                    gateway_session_key,
-                    session_source,
-                ),
-            )
+            assert idempotency_fingerprint is not None
+            assert idempotency_cache_key is not None
             try:
-                result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_response)
+                (result, usage), should_fanout = await _idem_cache.get_or_set_with_status(
+                    idempotency_cache_key, idempotency_fingerprint, _compute_response
+                )
             except Exception as e:
                 logger.error("Error running agent for responses: %s", e, exc_info=True)
                 return web.json_response(
@@ -5384,7 +5738,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=500,
                 )
 
-        final_response = _resolve_media_to_data_urls(result.get("final_response", ""))
+        # Keep transport presentation separate from native fanout eligibility:
+        # API fallbacks/errors must never become fabricated chat deliveries.
+        fanout_response = result.get("final_response", "")
+        final_response = _resolve_media_to_data_urls(fanout_response)
         if not final_response:
             final_response = _redact_api_error_text(result.get("error", "(No response generated)"))
 
@@ -5450,6 +5807,15 @@ class APIServerAdapter(BasePlatformAdapter):
         response_headers = {"X-Hermes-Session-Id": _effective_session_id}
         if gateway_session_key:
             response_headers["X-Hermes-Session-Key"] = gateway_session_key
+        if (
+            should_fanout
+            and not result.get("failed")
+            and not result.get("partial")
+            and result.get("completed", True)
+        ):
+            await self._fanout_completed_api_turn(
+                session_source=session_source, response_text=fanout_response, surface="responses",
+            )
         return web.json_response(response_data, headers=response_headers)
 
     # ------------------------------------------------------------------
@@ -6418,6 +6784,21 @@ class APIServerAdapter(BasePlatformAdapter):
 
         instructions = body.get("instructions")
         previous_response_id = body.get("previous_response_id")
+        fanout_claim = _terminal_fanout_claim_for_request(
+            request=request,
+            surface="runs",
+            body=body,
+            fingerprint_keys=[
+                "input",
+                "instructions",
+                "previous_response_id",
+                "conversation_history",
+                "session_id",
+                "model",
+            ],
+            gateway_session_key=gateway_session_key,
+            session_source=session_source,
+        )
 
         # Accept explicit conversation_history from the request body.
         # Precedence: explicit conversation_history > previous_response_id.
@@ -6691,6 +7072,19 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                 else:
                     final_response = result.get("final_response", "") if isinstance(result, dict) else ""
+                    if (
+                        isinstance(result, dict)
+                        and result.get("completed", True)
+                        and not result.get("partial")
+                        and bool(str(final_response).strip())
+                        and (
+                            fanout_claim is None
+                            or _idem_cache.claim_fanout(*fanout_claim)
+                        )
+                    ):
+                        await self._fanout_completed_api_turn(
+                            session_source=session_source, response_text=final_response, surface="runs",
+                        )
                     _put_event_if_active({
                         "event": "run.completed",
                         "run_id": run_id,
@@ -7251,20 +7645,31 @@ class APIServerAdapter(BasePlatformAdapter):
         (OSError: [Errno 24] Too many open files, #37011).
         """
         self._mark_disconnected()
-        if self._response_store is not None:
-            try:
-                self._response_store.close()
-            except Exception:
-                logger.debug(
-                    "Failed to close response store for %s", self.name, exc_info=True,
-                )
-        if self._site:
-            await self._site.stop()
-            self._site = None
-        if self._runner:
-            await self._runner.cleanup()
-            self._runner = None
-        self._app = None
+        # Stop accepting/serving requests first, then preserve already-scheduled
+        # native deliveries before releasing adapter-owned resources.
+        try:
+            if self._site:
+                await self._site.stop()
+                self._site = None
+            if self._runner:
+                await self._runner.cleanup()
+                self._runner = None
+            await self._drain_final_response_fanout()
+        except asyncio.CancelledError:
+            # GatewayRunner applies its own outer disconnect timeout. If that
+            # expires during aiohttp cleanup or our drain, cancel/reap delivery
+            # tasks before propagating cancellation so no gather/task is orphaned.
+            await self._drain_final_response_fanout(timeout=0)
+            raise
+        finally:
+            if self._response_store is not None:
+                try:
+                    self._response_store.close()
+                except Exception:
+                    logger.debug(
+                        "Failed to close response store for %s", self.name, exc_info=True,
+                    )
+            self._app = None
         logger.info("[%s] API server stopped", self.name)
 
     async def send(

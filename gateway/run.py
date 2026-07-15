@@ -6445,6 +6445,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     platform.value, time.monotonic() - started_at, suffix,
                 )
             else:
+                # Signal detached API fanout tasks exactly once at the hard
+                # runner deadline. The cancelled disconnect coroutine remains
+                # responsible for reaping them; this synchronous seam neither
+                # extends the timeout budget nor races a second drain.
+                cancel_fanout = getattr(
+                    adapter, "_cancel_final_response_fanout_now", None
+                )
+                if callable(cancel_fanout):
+                    try:
+                        cancel_fanout()
+                        # Deliver the cancellation signal before crossing the
+                        # teardown boundary, without waiting for a resistant
+                        # coroutine to finish unwinding.
+                        await asyncio.sleep(0)
+                    except Exception:
+                        logger.debug(
+                            "API final-response fanout cancellation failed",
+                            exc_info=True,
+                        )
                 logger.warning(
                     "✗ %s disconnect timed out after %.1fs - forcing continue%s",
                     platform.value, timeout, suffix,
@@ -6586,6 +6605,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
             profile=_profile,
         )
+
+    async def _deliver_api_final_response(
+        self,
+        *,
+        session_source: SessionSource,
+        content: str,
+        surface: str,
+    ) -> None:
+        """Deliver a completed API turn to its configured canonical session.
+
+        PR A resolved and authorized ``session_source`` at the API boundary.
+        This seam intentionally never parses request headers or resolves aliases.
+        """
+        adapter = self._adapter_for_source(session_source)
+        if adapter is None:
+            logger.warning(
+                "API final-response fanout unavailable surface=%s platform=%s chat=%s",
+                surface, session_source.platform.value, session_source.chat_id,
+            )
+            return
+        metadata = {"thread_id": session_source.thread_id} if session_source.thread_id else None
+        try:
+            result = await adapter.send(
+                session_source.chat_id, content, reply_to=None, metadata=metadata,
+            )
+        except Exception:
+            logger.exception(
+                "API final-response fanout delivery failed surface=%s platform=%s chat=%s",
+                surface, session_source.platform.value, session_source.chat_id,
+            )
+            return
+        if getattr(result, "success", True) is not True:
+            logger.warning(
+                "API final-response fanout rejected surface=%s platform=%s chat=%s error=%s",
+                surface, session_source.platform.value, session_source.chat_id,
+                getattr(result, "error", None),
+            )
 
     def _telegram_topic_mode_enabled(self, source: SessionSource) -> bool:
         """Return whether Telegram DM topic mode is active for this chat."""
@@ -10980,6 +11036,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _set_reaction(self._handle_reaction_event)
             adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
             adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
+            fanout_setter = getattr(adapter, "set_final_response_fanout_handler", None)
+            if callable(fanout_setter):
+                fanout_setter(self._deliver_api_final_response)
             adapter._busy_text_mode = self._busy_text_mode
             
             # Try to connect
@@ -13254,6 +13313,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     continue
 
             self._configure_profile_adapter(adapter, profile_name, platform)
+            fanout_setter = getattr(adapter, "set_final_response_fanout_handler", None)
+            if callable(fanout_setter):
+                fanout_setter(self._deliver_api_final_response)
 
             try:
                 with _profile_runtime_scope(profile_home):
