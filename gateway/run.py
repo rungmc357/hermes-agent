@@ -10279,11 +10279,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
 
     async def _redeliver_pending_obligations(self) -> int:
-        """Redeliver final responses recorded in the delivery ledger by a
-        previous (now dead) gateway process.
+        """Deliver claimable final responses from the shared delivery ledger.
 
-        Runs at startup BEFORE ``_schedule_resume_pending_sessions``. A
-        session with a recoverable obligation already produced its answer —
+        Runs at startup and from the live delivery watcher. Rows may be crash
+        recovery from a dead gateway or ownerless obligations queued by another
+        local Hermes surface such as Desktop. A session with a recoverable
+        obligation already produced its answer —
         the turn completed and only delivery is owed — so this method sends
         the stored text and clears ``resume_pending`` for that session,
         preventing the resume path from re-running (and re-paying for) a
@@ -10298,6 +10299,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from gateway.delivery_ledger import (
                 RECOVERED_MARKER,
                 ledger_enabled,
+                mark_attempting,
                 mark_delivered,
                 mark_failed,
                 sweep_recoverable,
@@ -10305,12 +10307,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             if not await asyncio.to_thread(ledger_enabled):
                 return 0
-            # Only claim rows we can actually send this boot: self.adapters
-            # holds a platform only after its connect() succeeded, and each
-            # claim spends one of the row's three redelivery attempts.
+            # Only claim rows we can actually send this boot. Include secondary
+            # multiplexed profiles; source.profile below still selects the exact
+            # adapter and fails closed when that profile's adapter is absent.
             _deliverable = {
                 getattr(p, "value", str(p)) for p in self.adapters
             }
+            for profile_adapters in getattr(self, "_profile_adapters", {}).values():
+                _deliverable.update(
+                    getattr(p, "value", str(p)) for p in profile_adapters
+                )
             claimed = await asyncio.to_thread(
                 sweep_recoverable, None, deliverable_platforms=_deliverable
             )
@@ -10330,9 +10336,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     row["obligation_id"], row.get("platform"),
                 )
                 continue
-            adapter = self.adapters.get(platform)
+            source = SessionSource(
+                platform=platform,
+                chat_id=str(row["chat_id"]),
+                chat_type="thread" if row.get("thread_id") else "dm",
+                thread_id=(str(row["thread_id"]) if row.get("thread_id") else None),
+                profile=(str(row["profile"]) if row.get("profile") else None),
+            )
+            adapter: Any = self._adapter_for_source(source)
             if adapter is None:
-                # Platform not connected this boot — leave the row claimed;
+                # Platform/profile not connected this boot — leave the row claimed;
                 # attempts cap + stale cutoff bound the retries on later boots.
                 continue
             content = row["content"]
@@ -10341,6 +10354,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             metadata = (
                 {"thread_id": row["thread_id"]} if row.get("thread_id") else None
             )
+            try:
+                mark_attempting(row["obligation_id"])
+            except Exception:
+                logger.debug("delivery ledger attempting update failed", exc_info=True)
             try:
                 result = await adapter.send(
                     chat_id=row["chat_id"],
@@ -10384,6 +10401,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         exc_info=True,
                     )
         return redelivered
+
+    async def _delivery_obligation_watcher(self, interval: float = 1.0) -> None:
+        """Continuously drain ownerless obligations queued by local surfaces.
+
+        Gateway-owned pending/failed rows remain protected by their live owner
+        stamp, so polling does not retry ordinary delivery failures in a loop.
+        """
+        while self._running:
+            await asyncio.sleep(interval)
+            await self._redeliver_pending_obligations()
 
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
@@ -11463,6 +11490,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # destination platform's home channel, then forges a synthetic user
         # turn so the agent kicks off the new chat.
         self._spawn_supervised(self._handoff_watcher, "handoff_watcher")
+
+        # Desktop/TUI gateways are separate processes. They queue successful
+        # replies for messaging-origin sessions into the durable ledger; this
+        # watcher claims and sends them through the live native adapter.
+        self._spawn_supervised(
+            self._delivery_obligation_watcher,
+            "delivery_obligation_watcher",
+        )
 
         # Start background async-delegation watcher — drains completion events
         # from delegate_task(background=true) subagents and injects each

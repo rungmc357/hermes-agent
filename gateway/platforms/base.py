@@ -6083,6 +6083,7 @@ class BasePlatformAdapter(ABC):
                                     chat_id=event.source.chat_id,
                                     thread_id=getattr(event.source, "thread_id", None),
                                     content=text_content,
+                                    profile=getattr(event.source, "profile", None),
                                 )
                                 await asyncio.to_thread(mark_attempting, _obligation_id)
                         except Exception:
