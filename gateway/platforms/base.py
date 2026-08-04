@@ -2655,6 +2655,10 @@ class BasePlatformAdapter(ABC):
     # never see these calls.
     supports_status_text: bool = False
 
+    # Runtime profile owning this concrete transport credential. This is not
+    # the routed session profile; GatewayRunner stamps it before connect.
+    _transport_profile: Optional[str] = None
+
     def set_status_text(self, chat_id: str, text: Optional[str]) -> None:
         """Set or clear (``None``) the live working-state phrase for a chat.
 
@@ -6662,10 +6666,14 @@ class BasePlatformAdapter(ABC):
             auto_thread_created=auto_thread_created,
             auto_thread_initial_name=auto_thread_initial_name,
         )
-        # In-process transport provenance is deliberately not serialized by
-        # SessionSource.to_dict(). The live receiving adapter is authoritative
-        # for this turn even when profile_routes selects a different runtime.
+        # Transport provenance is distinct from ``source.profile``: a profile
+        # route may send this turn to another runtime while replies must still
+        # use the adapter/bot that actually received it.  Keep the live adapter
+        # reference process-local; SessionManager snapshots only these trusted
+        # scalar identity fields into origin_json for later Desktop fanout.
         source._transport_adapter_ref = weakref.ref(self)
+        source._transport_platform = self.platform.value
+        source._transport_profile = getattr(self, "_transport_profile", None)
         return source
     
     @abstractmethod

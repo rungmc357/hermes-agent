@@ -68,6 +68,68 @@ def _source(profile: str | None = None) -> SessionSource:
     )
 
 
+@pytest.mark.asyncio
+async def test_primary_reconnect_reinstalls_api_fanout_handler(monkeypatch):
+    runner = GatewayRunner.__new__(GatewayRunner)
+    adapter = MagicMock()
+    adapter.platform = Platform.API_SERVER
+    config = PlatformConfig(enabled=True, extra={"key": "sk-test"})
+    runner._running = True
+    runner._failed_platforms = {
+        Platform.API_SERVER: {
+            "config": config,
+            "attempts": 0,
+            "next_retry": 0,
+        }
+    }
+    runner.adapters = {}
+    runner.delivery_router = MagicMock()
+    runner.delivery_router.adapters = {}
+    runner.session_store = MagicMock()
+    runner._busy_text_mode = "off"
+    runner._active_profile_name = lambda: "default"
+    runner._primary_message_handler = lambda: MagicMock()
+    runner._make_adapter_auth_check = lambda *_args, **_kwargs: MagicMock()
+    runner._create_adapter = MagicMock(return_value=adapter)
+    runner._sync_voice_mode_state_to_adapter = MagicMock()
+    runner._update_platform_runtime_status = MagicMock()
+    runner._schedule_resume_pending_sessions = MagicMock()
+
+    async def connect(*_args, **_kwargs):
+        runner._running = False
+        return True
+
+    runner._connect_adapter_with_timeout = AsyncMock(side_effect=connect)
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+    monkeypatch.setattr(
+        "gateway.channel_directory.build_channel_directory", AsyncMock()
+    )
+
+    await runner._platform_reconnect_watcher()
+
+    adapter.set_final_response_fanout_handler.assert_called_once_with(
+        runner._deliver_api_final_response
+    )
+    assert runner.adapters[Platform.API_SERVER] is adapter
+
+
+def test_secondary_adapter_configuration_installs_api_fanout_handler():
+    runner = GatewayRunner.__new__(GatewayRunner)
+    adapter = MagicMock()
+    adapter.platform = Platform.API_SERVER
+    runner.session_store = MagicMock()
+    runner._busy_text_mode = "off"
+    runner._make_profile_message_handler = MagicMock(return_value=MagicMock())
+    runner._make_profile_fatal_error_handler = MagicMock(return_value=MagicMock())
+    runner._make_adapter_auth_check = lambda *_args, **_kwargs: MagicMock()
+
+    runner._configure_profile_adapter(adapter, "work", Platform.API_SERVER)
+
+    adapter.set_final_response_fanout_handler.assert_called_once_with(
+        runner._deliver_api_final_response
+    )
+
+
 def _app(adapter: APIServerAdapter) -> web.Application:
     app = web.Application()
     app.router.add_post(

@@ -9359,6 +9359,19 @@ def _queue_desktop_origin_fanout(session: dict, content: str) -> bool:
         chat_id = str(stored.get("chat_id") or "").strip()
         if not chat_id:
             return False
+        # Runtime/session profile is not necessarily the bot credential that
+        # received this chat when profile_routes is configured. Only ingress-
+        # stamped transport provenance is authoritative for outbound adapter
+        # selection. Historical rows without it deliberately fail closed.
+        raw_origin = stored.get("origin_json")
+        origin = json.loads(raw_origin) if isinstance(raw_origin, str) else raw_origin
+        transport = origin.get("transport") if isinstance(origin, dict) else None
+        if not isinstance(transport, dict):
+            return False
+        transport_platform = str(transport.get("platform") or "").strip().lower()
+        transport_profile = str(transport.get("profile") or "").strip()
+        if transport_platform != platform or not transport_profile:
+            return False
 
         from gateway.delivery_ledger import (
             compute_obligation_id,
@@ -9370,21 +9383,16 @@ def _queue_desktop_origin_fanout(session: dict, content: str) -> bool:
             return False
         import uuid
 
-        profile_home = str(session.get("profile_home") or "").strip()
-        if profile_home and Path(profile_home).parent.name == "profiles":
-            profile = Path(profile_home).name
-        else:
-            profile = _current_profile_name()
         turn_ref = f"desktop:{uuid.uuid4().hex}"
         obligation_id = compute_obligation_id(session_key, turn_ref, content)
         record_external_obligation(
             obligation_id=obligation_id,
             session_key=session_key,
-            platform=platform,
+            platform=transport_platform,
             chat_id=chat_id,
             thread_id=(str(stored["thread_id"]) if stored.get("thread_id") else None),
             content=content,
-            profile=profile,
+            profile=transport_profile,
             # The turn thread currently has the resumed profile's HERMES_HOME
             # context override. Multiplexed messaging gateways drain the launch
             # store, so place cross-process obligations there explicitly.

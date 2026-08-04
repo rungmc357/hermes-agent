@@ -10302,23 +10302,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 mark_attempting,
                 mark_delivered,
                 mark_failed,
+                release_claim,
                 sweep_recoverable,
             )
 
             if not await asyncio.to_thread(ledger_enabled):
                 return 0
-            # Only claim rows we can actually send this boot. Include secondary
-            # multiplexed profiles; source.profile below still selects the exact
-            # adapter and fails closed when that profile's adapter is absent.
-            _deliverable = {
-                getattr(p, "value", str(p)) for p in self.adapters
-            }
-            for profile_adapters in getattr(self, "_profile_adapters", {}).values():
-                _deliverable.update(
-                    getattr(p, "value", str(p)) for p in profile_adapters
+            # Claim only exact transport routes live in this gateway. A runtime
+            # profile may differ from the bot/profile that received the message,
+            # so platform-only eligibility can cross credentials or strand rows.
+            active_profile = self._active_profile_name()
+            deliverable_routes: set[tuple[str, Optional[str]]] = set()
+            for platform in self.adapters:
+                platform_value = getattr(platform, "value", str(platform))
+                # Legacy gateway-owned obligations have no profile; newly
+                # persisted transport provenance names the active profile.
+                deliverable_routes.add((platform_value, None))
+                deliverable_routes.add((platform_value, active_profile))
+            for profile, profile_adapters in getattr(
+                self, "_profile_adapters", {}
+            ).items():
+                deliverable_routes.update(
+                    (getattr(platform, "value", str(platform)), profile)
+                    for platform in profile_adapters
                 )
             claimed = await asyncio.to_thread(
-                sweep_recoverable, None, deliverable_platforms=_deliverable
+                sweep_recoverable, None, deliverable_routes=deliverable_routes
             )
         except Exception:
             logger.debug("delivery ledger sweep failed", exc_info=True)
@@ -10345,8 +10354,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             adapter: Any = self._adapter_for_source(source)
             if adapter is None:
-                # Platform/profile not connected this boot — leave the row claimed;
-                # attempts cap + stale cutoff bound the retries on later boots.
+                # Exact adapter vanished after the route-aware claim (for
+                # example during reconnect). Return the row ownerless and refund
+                # the attempt so the live watcher can deliver when it returns.
+                try:
+                    await asyncio.to_thread(release_claim, row["obligation_id"])
+                except Exception:
+                    logger.debug("delivery ledger claim release failed", exc_info=True)
                 continue
             content = row["content"]
             if row.get("needs_marker"):
@@ -10355,7 +10369,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 {"thread_id": row["thread_id"]} if row.get("thread_id") else None
             )
             try:
-                mark_attempting(row["obligation_id"])
+                await asyncio.to_thread(mark_attempting, row["obligation_id"])
             except Exception:
                 logger.debug("delivery ledger attempting update failed", exc_info=True)
             try:
@@ -11050,23 +11064,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.warning("No adapter available for %s", _pval)
                 continue
             
-            # Set up message + fatal error handlers. Under multiplexing the
-            # default profile needs the same whole-handler runtime scope as a
-            # secondary profile: authorization and prompt rendering both run
-            # before the narrower agent-turn scope is installed.
-            adapter.set_message_handler(self._primary_message_handler())
-            adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
-            adapter.set_session_store(self.session_store)
-            adapter.set_busy_session_handler(self._handle_active_session_busy_message)
-            _set_reaction = getattr(adapter, "set_reaction_handler", None)
-            if callable(_set_reaction):
-                _set_reaction(self._handle_reaction_event)
-            adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
-            adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
-            fanout_setter = getattr(adapter, "set_final_response_fanout_handler", None)
-            if callable(fanout_setter):
-                fanout_setter(self._deliver_api_final_response)
-            adapter._busy_text_mode = self._busy_text_mode
+            self._configure_primary_adapter(adapter)
             
             # Try to connect
             logger.info("Connecting to %s...", platform.value)
@@ -12437,16 +12435,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         del self._failed_platforms[platform]
                         continue
 
-                    adapter.set_message_handler(self._primary_message_handler())
-                    adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
-                    adapter.set_session_store(self.session_store)
-                    adapter.set_busy_session_handler(self._handle_active_session_busy_message)
-                    _set_reaction = getattr(adapter, "set_reaction_handler", None)
-                    if callable(_set_reaction):
-                        _set_reaction(self._handle_reaction_event)
-                    adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
-                    adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
-                    adapter._busy_text_mode = self._busy_text_mode
+                    self._configure_primary_adapter(adapter)
 
                     # Reconnect after an outage: preserve the platform's
                     # server-side update queue so messages sent while the bot
@@ -13373,6 +13362,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 await self._safe_adapter_disconnect(adapter, platform)
         return connected
 
+    def _configure_final_response_fanout(
+        self, adapter: BasePlatformAdapter
+    ) -> None:
+        """Install optional API response fanout on every adapter lifecycle path."""
+        setter = getattr(adapter, "set_final_response_fanout_handler", None)
+        if callable(setter):
+            setter(self._deliver_api_final_response)
+
+    def _configure_primary_adapter(self, adapter: BasePlatformAdapter) -> None:
+        """Install handlers shared by primary startup and reconnect."""
+        # Durable transport owner is distinct from profile_routes runtime
+        # selection; ingress snapshots this identity for Desktop fanout.
+        adapter._transport_profile = self._active_profile_name()
+        # The default profile needs whole-handler runtime scope under multiplexing.
+        adapter.set_message_handler(self._primary_message_handler())
+        adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
+        adapter.set_session_store(self.session_store)
+        adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+        _set_reaction = getattr(adapter, "set_reaction_handler", None)
+        if callable(_set_reaction):
+            _set_reaction(self._handle_reaction_event)
+        adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
+        adapter.set_authorization_check(
+            self._make_adapter_auth_check(adapter.platform)
+        )
+        self._configure_final_response_fanout(adapter)
+        adapter._busy_text_mode = self._busy_text_mode
+
     def _configure_profile_adapter(
         self,
         adapter: BasePlatformAdapter,
@@ -13380,6 +13397,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         platform: Platform,
     ) -> None:
         """Install the profile-scoped handlers shared by startup and reconnect."""
+        adapter._transport_profile = profile_name
         adapter.set_message_handler(self._make_profile_message_handler(profile_name))
         adapter.set_fatal_error_handler(
             self._make_profile_fatal_error_handler(profile_name, platform)
@@ -13393,6 +13411,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter.set_authorization_check(
             self._make_adapter_auth_check(platform, profile_name=profile_name)
         )
+        self._configure_final_response_fanout(adapter)
         adapter._busy_text_mode = self._busy_text_mode
 
     async def _run_secondary_profile_reconnect(

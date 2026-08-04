@@ -280,6 +280,25 @@ def mark_failed(obligation_id: str, error: str = "") -> None:
     _update_state(obligation_id, "failed", error=error)
 
 
+def release_claim(obligation_id: str) -> None:
+    """Return this process's claim without spending a delivery attempt.
+
+    Used when an exact transport adapter disappears between route-aware sweep
+    and send. The owner guard prevents one gateway from releasing another
+    process's claim.
+    """
+    pid, started = _owner_stamp()
+    with _DB_LOCK, _transaction() as conn:
+        conn.execute(
+            """UPDATE delivery_obligations
+               SET owner_pid=NULL, owner_started_at=NULL,
+                   attempts=CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END,
+                   updated_at=?
+               WHERE obligation_id=? AND owner_pid=? AND owner_started_at IS ?""",
+            (time.time(), obligation_id, pid, started),
+        )
+
+
 def _update_state(obligation_id: str, state: str, error: str = "") -> None:
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
@@ -294,6 +313,7 @@ def sweep_recoverable(
     now: Optional[float] = None,
     *,
     deliverable_platforms: Optional[set] = None,
+    deliverable_routes: Optional[set[tuple[str, Optional[str]]]] = None,
 ) -> List[Dict[str, Any]]:
     """Claim undelivered rows owned by dead processes; return them for
     redelivery.
@@ -304,8 +324,9 @@ def sweep_recoverable(
     Rows over the attempts cap or older than the stale cutoff transition to
     'abandoned' instead of being returned.
 
-    ``deliverable_platforms`` (platform value strings) restricts claiming to
-    platforms the caller can actually send on this boot.  ``attempts`` is the
+    ``deliverable_platforms`` (platform value strings) preserves the legacy
+    coarse filter. ``deliverable_routes`` restricts external/multiplex rows by
+    exact ``(platform, transport_profile)``. ``attempts`` is the
     redelivery budget, so it must only be spent on a real send: a platform
     that failed to connect would otherwise burn one attempt per boot and hit
     the cap having never been sent once.  Rows for absent platforms are left
@@ -339,6 +360,11 @@ def sweep_recoverable(
             ):
                 # No adapter for this platform this boot — the caller cannot
                 # send, so claiming would spend an attempt on a no-op.
+                continue
+            route = (platform, str(profile).strip() if profile else None)
+            if deliverable_routes is not None and route not in deliverable_routes:
+                # Exact bot/profile is absent even if another adapter for this
+                # platform is live. Leave ownerless and preserve retry budget.
                 continue
             cursor = conn.execute(
                 """UPDATE delivery_obligations
