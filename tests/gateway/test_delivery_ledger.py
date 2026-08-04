@@ -9,6 +9,8 @@ id stability, and the startup redelivery sweep's contract:
 - poison rows abandon at the attempts cap / stale cutoff
 """
 
+import asyncio
+import sqlite3
 import time
 import threading
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -36,6 +38,7 @@ def _record(oid="ob-1", session_key="agent:main:slack:channel:C1", **kw):
         chat_id=kw.get("chat_id", "C1"),
         thread_id=kw.get("thread_id", "171.001"),
         content=kw.get("content", "the final answer"),
+        profile=kw.get("profile"),
     )
 
 
@@ -89,9 +92,65 @@ def _orphan(oid):
 
 
 class TestStateMachine:
+    def test_release_claim_matches_owner_with_unavailable_start_stamp(
+        self, monkeypatch
+    ):
+        _record()
+        with dl._connect() as conn:
+            conn.execute(
+                """UPDATE delivery_obligations
+                   SET owner_pid=4242, owner_started_at=NULL, attempts=1
+                   WHERE obligation_id='ob-1'"""
+            )
+        monkeypatch.setattr(dl, "_owner_stamp", lambda: (4242, None))
+
+        dl.release_claim("ob-1")
+
+        row = _row("ob-1")
+        assert row is not None
+        assert row["owner_pid"] is None
+        assert row["attempts"] == 0
+        with dl._connect() as conn:
+            owner_started_at = conn.execute(
+                "SELECT owner_started_at FROM delivery_obligations "
+                "WHERE obligation_id='ob-1'"
+            ).fetchone()[0]
+        assert owner_started_at is None
+
     def test_record_starts_pending(self):
         _record()
         assert _row("ob-1")["state"] == "pending"
+
+    def test_existing_schema_adds_profile_column(self):
+        path = dl._db_path()
+        with dl._DB_LOCK:
+            conn = sqlite3.connect(path)
+            try:
+                conn.execute("DROP TABLE IF EXISTS delivery_obligations")
+                conn.execute(
+                    """CREATE TABLE delivery_obligations (
+                        obligation_id TEXT PRIMARY KEY,
+                        session_key TEXT NOT NULL,
+                        platform TEXT NOT NULL,
+                        chat_id TEXT NOT NULL,
+                        thread_id TEXT,
+                        content TEXT NOT NULL,
+                        state TEXT NOT NULL,
+                        attempts INTEGER NOT NULL DEFAULT 0,
+                        created_at REAL NOT NULL,
+                        updated_at REAL NOT NULL,
+                        owner_pid INTEGER,
+                        owner_started_at INTEGER,
+                        last_error TEXT
+                    )"""
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+        with dl._connect() as conn:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}
+        assert "profile" in columns
 
 
 class TestObligationId:
@@ -121,6 +180,25 @@ class TestSweep:
         # Claim re-stamps ownership: a second sweep in the same (live)
         # process must not double-claim.
         assert dl.sweep_recoverable() == []
+
+    def test_external_row_is_immediately_claimable_with_profile(self):
+        dl.record_external_obligation(
+            obligation_id="desktop-1",
+            session_key="agent:work:telegram:dm:42",
+            platform="telegram",
+            chat_id="42",
+            thread_id="7",
+            content="answer from Desktop",
+            profile="work",
+        )
+
+        claimed = dl.sweep_recoverable(deliverable_platforms={"telegram"})
+
+        assert len(claimed) == 1
+        assert claimed[0]["profile"] == "work"
+        assert claimed[0]["needs_marker"] is False
+        assert claimed[0]["content"] == "answer from Desktop"
+        assert dl.sweep_recoverable(deliverable_platforms={"telegram"}) == []
 
 
 class TestPrune:
@@ -152,6 +230,8 @@ class TestGatewayRedeliverySweep:
 
         runner = object.__new__(GatewayRunner)
         runner.adapters = {Platform.SLACK: adapter} if adapter else {}
+        runner._profile_adapters = {}
+        runner._active_profile_name = lambda: "default"
         _store = MagicMock()
         _store.clear_resume_pending = AsyncMock()
         _store._store = None
@@ -201,14 +281,16 @@ class TestGatewayRedeliverySweep:
 
     @pytest.mark.parametrize(
         ("send_success", "ledger_method"),
-        [(True, "mark_delivered"), (False, "mark_failed")],
+        [
+            (True, "mark_attempting"),
+            (True, "mark_delivered"),
+            (False, "mark_failed"),
+        ],
     )
     @pytest.mark.asyncio
     async def test_slow_state_update_does_not_block_event_loop(
         self, send_success, ledger_method
     ):
-        import asyncio
-
         _record()
         _orphan("ob-1")
         runner = self._runner(self._adapter(success=send_success))
@@ -220,6 +302,128 @@ class TestGatewayRedeliverySweep:
             )
 
         assert blocked_event_loop == []
+
+    @pytest.mark.asyncio
+    async def test_external_row_uses_exact_multiplexed_profile_adapter(self):
+        from gateway.config import Platform
+
+        dl.record_external_obligation(
+            obligation_id="desktop-profile",
+            session_key="agent:work:telegram:dm:42",
+            platform="telegram",
+            chat_id="42",
+            thread_id="7",
+            content="profile answer",
+            profile="work",
+        )
+        default_adapter = self._adapter()
+        work_adapter = self._adapter()
+        runner = self._runner()
+        runner.adapters = {Platform.TELEGRAM: default_adapter}
+        runner._profile_adapters = {"work": {Platform.TELEGRAM: work_adapter}}
+        runner._active_profile_name = lambda: "default"
+
+        n = await runner._redeliver_pending_obligations()
+
+        assert n == 1
+        default_adapter.send.assert_not_awaited()
+        work_adapter.send.assert_awaited_once()
+        assert work_adapter.send.call_args.kwargs["metadata"] == {"thread_id": "7"}
+
+    @pytest.mark.asyncio
+    async def test_exact_profile_row_waits_without_claim_until_adapter_returns(self):
+        from gateway.config import Platform
+
+        dl.record_external_obligation(
+            obligation_id="desktop-work-offline",
+            session_key="agent:routed:telegram:dm:42",
+            platform="telegram",
+            chat_id="42",
+            thread_id=None,
+            content="profile answer",
+            profile="work",
+        )
+        default_adapter = self._adapter()
+        runner = self._runner()
+        runner.adapters = {Platform.TELEGRAM: default_adapter}
+
+        assert await runner._redeliver_pending_obligations() == 0
+        row = _row("desktop-work-offline")
+        assert row is not None
+        assert row["attempts"] == 0
+        assert row["owner_pid"] is None
+        default_adapter.send.assert_not_awaited()
+
+        work_adapter = self._adapter()
+        runner._profile_adapters = {"work": {Platform.TELEGRAM: work_adapter}}
+        assert await runner._redeliver_pending_obligations() == 1
+        default_adapter.send.assert_not_awaited()
+        work_adapter.send.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_claim_is_released_if_exact_adapter_disappears_before_send(self, monkeypatch):
+        from gateway.config import Platform
+
+        dl.record_external_obligation(
+            obligation_id="desktop-race",
+            session_key="agent:work:telegram:dm:42",
+            platform="telegram",
+            chat_id="42",
+            thread_id=None,
+            content="profile answer",
+            profile="work",
+        )
+        runner = self._runner()
+        runner._profile_adapters = {"work": {Platform.TELEGRAM: self._adapter()}}
+        monkeypatch.setattr(runner, "_adapter_for_source", lambda _source: None)
+
+        assert await runner._redeliver_pending_obligations() == 0
+        row = _row("desktop-race")
+        assert row is not None
+        assert row["attempts"] == 0
+        assert row["owner_pid"] is None
+
+    @pytest.mark.asyncio
+    async def test_slow_claim_release_does_not_block_event_loop(self, monkeypatch):
+        from gateway.config import Platform
+
+        dl.record_external_obligation(
+            obligation_id="desktop-slow-release",
+            session_key="agent:work:telegram:dm:42",
+            platform="telegram",
+            chat_id="42",
+            thread_id=None,
+            content="profile answer",
+            profile="work",
+        )
+        runner = self._runner()
+        runner._profile_adapters = {"work": {Platform.TELEGRAM: self._adapter()}}
+        monkeypatch.setattr(runner, "_adapter_for_source", lambda _source: None)
+        slow_release, event_loop_witness, blocked_event_loop = _blocking_probe()
+
+        with patch.object(dl, "release_claim", side_effect=slow_release):
+            await asyncio.gather(
+                runner._redeliver_pending_obligations(), event_loop_witness()
+            )
+
+        assert blocked_event_loop == []
+
+    @pytest.mark.asyncio
+    async def test_marks_attempting_before_send_so_crash_recovery_is_visible(self):
+        adapter = self._adapter()
+        adapter.send.side_effect = asyncio.CancelledError()
+        runner = self._runner(adapter)
+        _record()
+        _orphan("ob-1")
+
+        with pytest.raises(asyncio.CancelledError):
+            await runner._redeliver_pending_obligations()
+
+        with dl._connect() as conn:
+            row = conn.execute(
+                "SELECT state FROM delivery_obligations WHERE obligation_id='ob-1'"
+            ).fetchone()
+        assert row[0] == "attempting"
 
 
 class TestAttemptsOnlySpentOnRealSends:
@@ -275,6 +479,8 @@ class TestUnconnectedPlatformKeepsItsBudget:
 
         runner = object.__new__(GatewayRunner)
         runner.adapters = {}  # slack failed to connect this boot
+        runner._profile_adapters = {}
+        runner._active_profile_name = lambda: "default"
         _store = MagicMock()
         _store.clear_resume_pending = AsyncMock()
         _store._store = None

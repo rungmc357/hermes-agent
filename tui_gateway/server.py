@@ -9335,6 +9335,81 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
     return stop
 
 
+def _queue_desktop_origin_fanout(session: dict, content: str) -> bool:
+    """Queue a Desktop reply for its persisted Telegram/Discord origin.
+
+    The live session intentionally identifies as ``desktop`` so prompts and UI
+    policy remain Desktop-native. Routing comes from the canonical stored row,
+    which resume does not rewrite. This prevents caller-provided Desktop RPC
+    parameters from choosing an arbitrary outbound destination.
+    """
+    if _session_source(session) != "desktop" or not isinstance(content, str) or not content.strip():
+        return False
+    session_key = str(session.get("session_key") or "").strip()
+    if not session_key:
+        return False
+    try:
+        with _session_db(session) as db:
+            stored = db.get_session(session_key) if db is not None else None
+        if not isinstance(stored, dict):
+            return False
+        platform = str(stored.get("source") or "").strip().lower()
+        if platform not in {"telegram", "discord"}:
+            return False
+        chat_id = str(stored.get("chat_id") or "").strip()
+        if not chat_id:
+            return False
+        # Runtime/session profile is not necessarily the bot credential that
+        # received this chat when profile_routes is configured. Only ingress-
+        # stamped transport provenance is authoritative for outbound adapter
+        # selection. Historical rows without it deliberately fail closed.
+        raw_origin = stored.get("origin_json")
+        origin = json.loads(raw_origin) if isinstance(raw_origin, str) else raw_origin
+        transport = origin.get("transport") if isinstance(origin, dict) else None
+        if not isinstance(transport, dict):
+            return False
+        transport_platform = str(transport.get("platform") or "").strip().lower()
+        transport_profile = str(transport.get("profile") or "").strip()
+        if transport_platform != platform or not transport_profile:
+            return False
+
+        from gateway.delivery_ledger import (
+            compute_obligation_id,
+            ledger_enabled,
+            record_external_obligation,
+        )
+
+        if not ledger_enabled():
+            return False
+        import uuid
+
+        turn_ref = f"desktop:{uuid.uuid4().hex}"
+        obligation_id = compute_obligation_id(session_key, turn_ref, content)
+        record_external_obligation(
+            obligation_id=obligation_id,
+            session_key=session_key,
+            platform=transport_platform,
+            chat_id=chat_id,
+            thread_id=(str(stored["thread_id"]) if stored.get("thread_id") else None),
+            content=content,
+            profile=transport_profile,
+            # The turn thread currently has the resumed profile's HERMES_HOME
+            # context override. Multiplexed messaging gateways drain the launch
+            # store, so place cross-process obligations there explicitly.
+            db_path=Path(_hermes_home) / "state.db",
+        )
+        return True
+    except Exception:
+        # Fanout is best-effort and must never turn a successful Desktop turn
+        # into an error. The transcript is already durable and remains resumable.
+        logger.warning(
+            "desktop origin fanout queue failed session=%s",
+            session_key,
+            exc_info=True,
+        )
+        return False
+
+
 def _run_prompt_submit(
     rid,
     sid: str,
@@ -9854,6 +9929,18 @@ def _run_prompt_submit(
                 payload["recoverable"] = True
             _retire_turn_marker(session, marker_key)
             _emit("message.complete", sid, payload)
+
+            # The Desktop and messaging gateway are separate processes. Queue
+            # only a successfully persisted final response; a live gateway
+            # watcher will resolve the exact profile adapter and deliver it to
+            # the Telegram/Discord chat or thread recorded on this session.
+            if (
+                status == "complete"
+                and not status_note
+                and isinstance(raw, str)
+                and raw.strip()
+            ):
+                _queue_desktop_origin_fanout(session, raw)
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
             # After every TUI turn, if a /goal is active, ask the judge

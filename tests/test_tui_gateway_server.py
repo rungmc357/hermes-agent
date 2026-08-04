@@ -7773,6 +7773,7 @@ def test_prompt_submit_sets_approval_session_key(monkeypatch):
     from tools.approval import get_current_session_key
 
     captured = {}
+    fanout = []
 
     class _Agent:
         def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
@@ -7794,6 +7795,11 @@ def test_prompt_submit_sets_approval_session_key(monkeypatch):
     monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+    monkeypatch.setattr(
+        server,
+        "_queue_desktop_origin_fanout",
+        lambda session, content: fanout.append((session["session_key"], content)),
+    )
 
     resp = server.handle_request(
         {
@@ -7805,6 +7811,7 @@ def test_prompt_submit_sets_approval_session_key(monkeypatch):
 
     assert resp["result"]["status"] == "streaming"
     assert captured["session_key"] == "session-key"
+    assert fanout == [("session-key", "ok")]
 
 
 def test_prompt_submit_expands_context_refs(monkeypatch):

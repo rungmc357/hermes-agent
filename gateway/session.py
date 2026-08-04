@@ -216,6 +216,14 @@ class SessionSource:
     # forge it across the wire or have it restored from persistence.
     delivered_via_upstream_relay: bool = False
 
+    # Trusted process-local transport provenance. These are never accepted by
+    # ``from_dict`` or emitted by ``to_dict``. Native adapters stamp them at
+    # ingress; SessionManager may snapshot the scalar platform/profile into its
+    # authoritative state.db origin_json for crash-safe outbound continuity.
+    _transport_adapter_ref: Any = field(default=None, init=False, repr=False, compare=False)
+    _transport_platform: Optional[str] = field(default=None, init=False, repr=False, compare=False)
+    _transport_profile: Optional[str] = field(default=None, init=False, repr=False, compare=False)
+
     def __post_init__(self) -> None:
         # D-Q2.5 dual-field reconciliation: `scope_id` is canonical, `guild_id`
         # is the deprecated alias. Mirror whichever was provided onto the other
@@ -2000,7 +2008,19 @@ class SessionStore:
         try:
             origin_json = None
             try:
-                origin_json = json.dumps(source.to_dict())
+                origin = source.to_dict()
+                transport_platform = str(
+                    getattr(source, "_transport_platform", "") or ""
+                ).strip()
+                transport_profile = str(
+                    getattr(source, "_transport_profile", "") or ""
+                ).strip()
+                if transport_platform and transport_profile:
+                    origin["transport"] = {
+                        "platform": transport_platform,
+                        "profile": transport_profile,
+                    }
+                origin_json = json.dumps(origin)
             except Exception:
                 pass
             recorder(

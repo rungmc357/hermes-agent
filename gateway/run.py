@@ -6445,6 +6445,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     platform.value, time.monotonic() - started_at, suffix,
                 )
             else:
+                # Signal detached API fanout tasks exactly once at the hard
+                # runner deadline. The cancelled disconnect coroutine remains
+                # responsible for reaping them; this synchronous seam neither
+                # extends the timeout budget nor races a second drain.
+                cancel_fanout = getattr(
+                    adapter, "_cancel_final_response_fanout_now", None
+                )
+                if callable(cancel_fanout):
+                    try:
+                        cancel_fanout()
+                        # Deliver the cancellation signal before crossing the
+                        # teardown boundary, without waiting for a resistant
+                        # coroutine to finish unwinding.
+                        await asyncio.sleep(0)
+                    except Exception:
+                        logger.debug(
+                            "API final-response fanout cancellation failed",
+                            exc_info=True,
+                        )
                 logger.warning(
                     "✗ %s disconnect timed out after %.1fs - forcing continue%s",
                     platform.value, timeout, suffix,
@@ -6586,6 +6605,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
             profile=_profile,
         )
+
+    async def _deliver_api_final_response(
+        self,
+        *,
+        session_source: SessionSource,
+        content: str,
+        surface: str,
+    ) -> None:
+        """Deliver a completed API turn to its configured canonical session.
+
+        PR A resolved and authorized ``session_source`` at the API boundary.
+        This seam intentionally never parses request headers or resolves aliases.
+        """
+        adapter = self._adapter_for_source(session_source)
+        if adapter is None:
+            logger.warning(
+                "API final-response fanout unavailable surface=%s platform=%s chat=%s",
+                surface, session_source.platform.value, session_source.chat_id,
+            )
+            return
+        metadata = {"thread_id": session_source.thread_id} if session_source.thread_id else None
+        try:
+            result = await adapter.send(
+                session_source.chat_id, content, reply_to=None, metadata=metadata,
+            )
+        except Exception:
+            logger.exception(
+                "API final-response fanout delivery failed surface=%s platform=%s chat=%s",
+                surface, session_source.platform.value, session_source.chat_id,
+            )
+            return
+        if getattr(result, "success", True) is not True:
+            logger.warning(
+                "API final-response fanout rejected surface=%s platform=%s chat=%s error=%s",
+                surface, session_source.platform.value, session_source.chat_id,
+                getattr(result, "error", None),
+            )
 
     def _telegram_topic_mode_enabled(self, source: SessionSource) -> bool:
         """Return whether Telegram DM topic mode is active for this chat."""
@@ -10223,11 +10279,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
 
     async def _redeliver_pending_obligations(self) -> int:
-        """Redeliver final responses recorded in the delivery ledger by a
-        previous (now dead) gateway process.
+        """Deliver claimable final responses from the shared delivery ledger.
 
-        Runs at startup BEFORE ``_schedule_resume_pending_sessions``. A
-        session with a recoverable obligation already produced its answer —
+        Runs at startup and from the live delivery watcher. Rows may be crash
+        recovery from a dead gateway or ownerless obligations queued by another
+        local Hermes surface such as Desktop. A session with a recoverable
+        obligation already produced its answer —
         the turn completed and only delivery is owed — so this method sends
         the stored text and clears ``resume_pending`` for that session,
         preventing the resume path from re-running (and re-paying for) a
@@ -10242,21 +10299,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from gateway.delivery_ledger import (
                 RECOVERED_MARKER,
                 ledger_enabled,
+                mark_attempting,
                 mark_delivered,
                 mark_failed,
+                release_claim,
                 sweep_recoverable,
             )
 
             if not await asyncio.to_thread(ledger_enabled):
                 return 0
-            # Only claim rows we can actually send this boot: self.adapters
-            # holds a platform only after its connect() succeeded, and each
-            # claim spends one of the row's three redelivery attempts.
-            _deliverable = {
-                getattr(p, "value", str(p)) for p in self.adapters
-            }
+            # Claim only exact transport routes live in this gateway. A runtime
+            # profile may differ from the bot/profile that received the message,
+            # so platform-only eligibility can cross credentials or strand rows.
+            active_profile = self._active_profile_name()
+            deliverable_routes: set[tuple[str, Optional[str]]] = set()
+            for platform in self.adapters:
+                platform_value = getattr(platform, "value", str(platform))
+                # Legacy gateway-owned obligations have no profile; newly
+                # persisted transport provenance names the active profile.
+                deliverable_routes.add((platform_value, None))
+                deliverable_routes.add((platform_value, active_profile))
+            for profile, profile_adapters in getattr(
+                self, "_profile_adapters", {}
+            ).items():
+                deliverable_routes.update(
+                    (getattr(platform, "value", str(platform)), profile)
+                    for platform in profile_adapters
+                )
             claimed = await asyncio.to_thread(
-                sweep_recoverable, None, deliverable_platforms=_deliverable
+                sweep_recoverable, None, deliverable_routes=deliverable_routes
             )
         except Exception:
             logger.debug("delivery ledger sweep failed", exc_info=True)
@@ -10274,10 +10345,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     row["obligation_id"], row.get("platform"),
                 )
                 continue
-            adapter = self.adapters.get(platform)
+            source = SessionSource(
+                platform=platform,
+                chat_id=str(row["chat_id"]),
+                chat_type="thread" if row.get("thread_id") else "dm",
+                thread_id=(str(row["thread_id"]) if row.get("thread_id") else None),
+                profile=(str(row["profile"]) if row.get("profile") else None),
+            )
+            adapter: Any = self._adapter_for_source(source)
             if adapter is None:
-                # Platform not connected this boot — leave the row claimed;
-                # attempts cap + stale cutoff bound the retries on later boots.
+                # Exact adapter vanished after the route-aware claim (for
+                # example during reconnect). Return the row ownerless and refund
+                # the attempt so the live watcher can deliver when it returns.
+                try:
+                    await asyncio.to_thread(release_claim, row["obligation_id"])
+                except Exception:
+                    logger.debug("delivery ledger claim release failed", exc_info=True)
                 continue
             content = row["content"]
             if row.get("needs_marker"):
@@ -10285,6 +10368,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             metadata = (
                 {"thread_id": row["thread_id"]} if row.get("thread_id") else None
             )
+            try:
+                await asyncio.to_thread(mark_attempting, row["obligation_id"])
+            except Exception:
+                logger.debug("delivery ledger attempting update failed", exc_info=True)
             try:
                 result = await adapter.send(
                     chat_id=row["chat_id"],
@@ -10328,6 +10415,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         exc_info=True,
                     )
         return redelivered
+
+    async def _delivery_obligation_watcher(self, interval: float = 1.0) -> None:
+        """Continuously drain ownerless obligations queued by local surfaces.
+
+        Gateway-owned pending/failed rows remain protected by their live owner
+        stamp, so polling does not retry ordinary delivery failures in a loop.
+        """
+        while self._running:
+            await asyncio.sleep(interval)
+            await self._redeliver_pending_obligations()
 
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
@@ -10967,20 +11064,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.warning("No adapter available for %s", _pval)
                 continue
             
-            # Set up message + fatal error handlers. Under multiplexing the
-            # default profile needs the same whole-handler runtime scope as a
-            # secondary profile: authorization and prompt rendering both run
-            # before the narrower agent-turn scope is installed.
-            adapter.set_message_handler(self._primary_message_handler())
-            adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
-            adapter.set_session_store(self.session_store)
-            adapter.set_busy_session_handler(self._handle_active_session_busy_message)
-            _set_reaction = getattr(adapter, "set_reaction_handler", None)
-            if callable(_set_reaction):
-                _set_reaction(self._handle_reaction_event)
-            adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
-            adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
-            adapter._busy_text_mode = self._busy_text_mode
+            self._configure_primary_adapter(adapter)
             
             # Try to connect
             logger.info("Connecting to %s...", platform.value)
@@ -11404,6 +11488,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # destination platform's home channel, then forges a synthetic user
         # turn so the agent kicks off the new chat.
         self._spawn_supervised(self._handoff_watcher, "handoff_watcher")
+
+        # Desktop/TUI gateways are separate processes. They queue successful
+        # replies for messaging-origin sessions into the durable ledger; this
+        # watcher claims and sends them through the live native adapter.
+        self._spawn_supervised(
+            self._delivery_obligation_watcher,
+            "delivery_obligation_watcher",
+        )
 
         # Start background async-delegation watcher — drains completion events
         # from delegate_task(background=true) subagents and injects each
@@ -12343,16 +12435,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         del self._failed_platforms[platform]
                         continue
 
-                    adapter.set_message_handler(self._primary_message_handler())
-                    adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
-                    adapter.set_session_store(self.session_store)
-                    adapter.set_busy_session_handler(self._handle_active_session_busy_message)
-                    _set_reaction = getattr(adapter, "set_reaction_handler", None)
-                    if callable(_set_reaction):
-                        _set_reaction(self._handle_reaction_event)
-                    adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
-                    adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
-                    adapter._busy_text_mode = self._busy_text_mode
+                    self._configure_primary_adapter(adapter)
 
                     # Reconnect after an outage: preserve the platform's
                     # server-side update queue so messages sent while the bot
@@ -13254,6 +13337,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     continue
 
             self._configure_profile_adapter(adapter, profile_name, platform)
+            fanout_setter = getattr(adapter, "set_final_response_fanout_handler", None)
+            if callable(fanout_setter):
+                fanout_setter(self._deliver_api_final_response)
 
             try:
                 with _profile_runtime_scope(profile_home):
@@ -13276,6 +13362,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 await self._safe_adapter_disconnect(adapter, platform)
         return connected
 
+    def _configure_final_response_fanout(
+        self, adapter: BasePlatformAdapter
+    ) -> None:
+        """Install optional API response fanout on every adapter lifecycle path."""
+        setter = getattr(adapter, "set_final_response_fanout_handler", None)
+        if callable(setter):
+            setter(self._deliver_api_final_response)
+
+    def _configure_primary_adapter(self, adapter: BasePlatformAdapter) -> None:
+        """Install handlers shared by primary startup and reconnect."""
+        # Durable transport owner is distinct from profile_routes runtime
+        # selection; ingress snapshots this identity for Desktop fanout.
+        adapter._transport_profile = self._active_profile_name()
+        # The default profile needs whole-handler runtime scope under multiplexing.
+        adapter.set_message_handler(self._primary_message_handler())
+        adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
+        adapter.set_session_store(self.session_store)
+        adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+        _set_reaction = getattr(adapter, "set_reaction_handler", None)
+        if callable(_set_reaction):
+            _set_reaction(self._handle_reaction_event)
+        adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
+        adapter.set_authorization_check(
+            self._make_adapter_auth_check(adapter.platform)
+        )
+        self._configure_final_response_fanout(adapter)
+        adapter._busy_text_mode = self._busy_text_mode
+
     def _configure_profile_adapter(
         self,
         adapter: BasePlatformAdapter,
@@ -13283,6 +13397,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         platform: Platform,
     ) -> None:
         """Install the profile-scoped handlers shared by startup and reconnect."""
+        adapter._transport_profile = profile_name
         adapter.set_message_handler(self._make_profile_message_handler(profile_name))
         adapter.set_fatal_error_handler(
             self._make_profile_fatal_error_handler(profile_name, platform)
@@ -13296,6 +13411,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter.set_authorization_check(
             self._make_adapter_auth_check(platform, profile_name=profile_name)
         )
+        self._configure_final_response_fanout(adapter)
         adapter._busy_text_mode = self._busy_text_mode
 
     async def _run_secondary_profile_reconnect(

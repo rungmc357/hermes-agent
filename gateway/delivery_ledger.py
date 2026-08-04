@@ -47,6 +47,7 @@ import sqlite3
 import threading
 import time
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
@@ -75,8 +76,8 @@ def _db_path():
     return get_hermes_home() / "state.db"
 
 
-def _connect() -> sqlite3.Connection:
-    path = _db_path()
+def _connect(db_path: Optional[Path] = None) -> sqlite3.Connection:
+    path = db_path or _db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=10)
     try:
@@ -101,6 +102,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             chat_id TEXT NOT NULL,
             thread_id TEXT,
             content TEXT NOT NULL,
+            profile TEXT,
             state TEXT NOT NULL,
             attempts INTEGER NOT NULL DEFAULT 0,
             created_at REAL NOT NULL,
@@ -110,10 +112,23 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             last_error TEXT
         )"""
     )
+    # Additive compatibility for ledgers created before profile-aware external
+    # producers (Desktop/TUI gateway) could queue an obligation for a
+    # multiplexed messaging adapter.
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}
+    if "profile" not in columns:
+        try:
+            conn.execute("ALTER TABLE delivery_obligations ADD COLUMN profile TEXT")
+        except sqlite3.OperationalError as exc:
+            # Desktop and gateway are separate processes and can both open an
+            # old ledger during the first post-update second. The loser of that
+            # additive migration race sees the column already present.
+            if "duplicate column name" not in str(exc).lower():
+                raise
 
 
 @contextmanager
-def _transaction() -> Iterator[sqlite3.Connection]:
+def _transaction(db_path: Optional[Path] = None) -> Iterator[sqlite3.Connection]:
     """Open a connection, commit/rollback on exit, and ALWAYS close it.
 
     ``sqlite3.Connection.__enter__``/``__exit__`` only commit or roll back the
@@ -124,7 +139,7 @@ def _transaction() -> Iterator[sqlite3.Connection]:
     bug was #69567 / PR #69594). ``record_obligation`` runs on every outbound
     final response, so this ledger is the highest-frequency leaker.
     """
-    conn = _connect()
+    conn = _connect(db_path)
     try:
         with conn:
             yield conn
@@ -193,6 +208,7 @@ def record_obligation(
     chat_id: str,
     thread_id: Optional[str],
     content: str,
+    profile: Optional[str] = None,
 ) -> None:
     """Record a final response as owed to the platform (state='pending')."""
     now = time.time()
@@ -201,14 +217,55 @@ def record_obligation(
         conn.execute(
             """INSERT OR REPLACE INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
-                content, state, attempts, created_at, updated_at,
+                content, profile, state, attempts, created_at, updated_at,
                 owner_pid, owner_started_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)""",
             (obligation_id, session_key, platform, str(chat_id),
-             str(thread_id) if thread_id else None, content, now, now,
+             str(thread_id) if thread_id else None, content, profile, now, now,
              pid, started),
         )
     _prune()
+
+
+def record_external_obligation(
+    *,
+    obligation_id: str,
+    session_key: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str],
+    content: str,
+    profile: Optional[str] = None,
+    db_path: Optional[Path] = None,
+) -> None:
+    """Queue a final response produced outside the messaging gateway.
+
+    The NULL owner is intentional: it makes the row immediately claimable by
+    the live gateway's delivery watcher instead of waiting for the producing
+    Desktop/TUI process to exit. The gateway atomically stamps itself as owner
+    before sending, preserving the ledger's single-claimer contract.
+    """
+    now = time.time()
+    with _DB_LOCK, _transaction(db_path) as conn:
+        conn.execute(
+            """INSERT OR IGNORE INTO delivery_obligations
+               (obligation_id, session_key, platform, chat_id, thread_id,
+                content, profile, state, attempts, created_at, updated_at,
+                owner_pid, owner_started_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, NULL, NULL)""",
+            (
+                obligation_id,
+                session_key,
+                platform,
+                str(chat_id),
+                str(thread_id) if thread_id else None,
+                content,
+                profile,
+                now,
+                now,
+            ),
+        )
+    _prune(db_path=db_path)
 
 
 def mark_attempting(obligation_id: str) -> None:
@@ -221,6 +278,25 @@ def mark_delivered(obligation_id: str) -> None:
 
 def mark_failed(obligation_id: str, error: str = "") -> None:
     _update_state(obligation_id, "failed", error=error)
+
+
+def release_claim(obligation_id: str) -> None:
+    """Return this process's claim without spending a delivery attempt.
+
+    Used when an exact transport adapter disappears between route-aware sweep
+    and send. The owner guard prevents one gateway from releasing another
+    process's claim.
+    """
+    pid, started = _owner_stamp()
+    with _DB_LOCK, _transaction() as conn:
+        conn.execute(
+            """UPDATE delivery_obligations
+               SET owner_pid=NULL, owner_started_at=NULL,
+                   attempts=CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END,
+                   updated_at=?
+               WHERE obligation_id=? AND owner_pid=? AND owner_started_at IS ?""",
+            (time.time(), obligation_id, pid, started),
+        )
 
 
 def _update_state(obligation_id: str, state: str, error: str = "") -> None:
@@ -237,6 +313,7 @@ def sweep_recoverable(
     now: Optional[float] = None,
     *,
     deliverable_platforms: Optional[set] = None,
+    deliverable_routes: Optional[set[tuple[str, Optional[str]]]] = None,
 ) -> List[Dict[str, Any]]:
     """Claim undelivered rows owned by dead processes; return them for
     redelivery.
@@ -247,8 +324,9 @@ def sweep_recoverable(
     Rows over the attempts cap or older than the stale cutoff transition to
     'abandoned' instead of being returned.
 
-    ``deliverable_platforms`` (platform value strings) restricts claiming to
-    platforms the caller can actually send on this boot.  ``attempts`` is the
+    ``deliverable_platforms`` (platform value strings) preserves the legacy
+    coarse filter. ``deliverable_routes`` restricts external/multiplex rows by
+    exact ``(platform, transport_profile)``. ``attempts`` is the
     redelivery budget, so it must only be spent on a real send: a platform
     that failed to connect would otherwise burn one attempt per boot and hit
     the cap having never been sent once.  Rows for absent platforms are left
@@ -260,12 +338,12 @@ def sweep_recoverable(
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
-                      content, state, attempts, created_at,
+                      content, profile, state, attempts, created_at,
                       owner_pid, owner_started_at
                FROM delivery_obligations
                WHERE state IN ('pending', 'attempting', 'failed')"""
         ).fetchall()
-        for (oid, session_key, platform, chat_id, thread_id, content, state,
+        for (oid, session_key, platform, chat_id, thread_id, content, profile, state,
              attempts, created_at, owner_pid, owner_started_at) in rows:
             if _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
@@ -283,6 +361,11 @@ def sweep_recoverable(
                 # No adapter for this platform this boot — the caller cannot
                 # send, so claiming would spend an attempt on a no-op.
                 continue
+            route = (platform, str(profile).strip() if profile else None)
+            if deliverable_routes is not None and route not in deliverable_routes:
+                # Exact bot/profile is absent even if another adapter for this
+                # platform is live. Leave ownerless and preserve retry budget.
+                continue
             cursor = conn.execute(
                 """UPDATE delivery_obligations
                    SET owner_pid=?, owner_started_at=?, attempts=attempts+1,
@@ -298,6 +381,7 @@ def sweep_recoverable(
                     "chat_id": chat_id,
                     "thread_id": thread_id,
                     "content": content,
+                    "profile": profile,
                     # pending = send never started, redeliver plainly;
                     # attempting/failed = ambiguous or rejected, carry marker.
                     "needs_marker": state != "pending",
@@ -306,11 +390,11 @@ def sweep_recoverable(
     return claimed
 
 
-def _prune(now: Optional[float] = None) -> None:
+def _prune(now: Optional[float] = None, *, db_path: Optional[Path] = None) -> None:
     now = now if now is not None else time.time()
     cutoff = now - _RETENTION_SECONDS
     try:
-        with _transaction() as conn:
+        with _transaction(db_path) as conn:
             conn.execute(
                 """DELETE FROM delivery_obligations
                    WHERE state IN ('delivered', 'abandoned') AND updated_at < ?""",
