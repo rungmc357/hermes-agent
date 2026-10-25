@@ -833,6 +833,27 @@ def _read_terminal_shell_init_config() -> tuple[list[str], bool]:
         return [], True
 
 
+_TASKPOLICY = "/usr/sbin/taskpolicy"
+
+
+def process_priority_prefix() -> list[str]:
+    """argv prefix that runs a host terminal command below Hermes' own CPU priority when
+    ``terminal.process_priority: low``, so a CPU-bound command (``make -j``, a test swarm) cannot
+    starve the gateway/serve loop that answers every profile. An argv prefix rather than a
+    ``preexec_fn`` (unsafe in the threaded gateway; a macOS QoS clamp set there does not survive
+    ``exec``); niceness and the clamp are inherited by everything the shell starts. macOS largely
+    ignores nice, so it gets the ``utility`` QoS clamp instead. No-op on Windows."""
+    from hermes_cli.config import load_config_readonly
+    terminal_cfg = load_config_readonly().get("terminal")
+    level = terminal_cfg.get("process_priority") if isinstance(terminal_cfg, dict) else None
+    if str(level or "").strip().lower() != "low" or _IS_WINDOWS:
+        return []
+    if sys.platform == "darwin" and os.path.exists(_TASKPOLICY):
+        return [_TASKPOLICY, "-c", "utility"]
+    nice = shutil.which("nice")
+    return [nice, "-n", "10"] if nice else []
+
+
 def _resolve_shell_init_files() -> list[str]:
     """Files to source before the login-shell snapshot (``~``/``${VAR}`` expanded,
     missing dropped). ``auto_source_bashrc`` applies only without an explicit list:
@@ -1140,7 +1161,7 @@ class LocalEnvironment(BaseEnvironment):
         if login:
             cmd_string = _append_dropped_path_entries(cmd_string, run_env.get("PATH", ""))
             cmd_string = _prepend_shell_init(cmd_string, _resolve_shell_init_files())
-        args = [bash, *(["-l"] if login else []), "-c", cmd_string]
+        args = [*process_priority_prefix(), bash, *(["-l"] if login else []), "-c", cmd_string]
         self._recover_cwd()
         # Not spawn_owned: an awaited command needs no spawn-ledger entry; own_process_groups below hands
         # its group to the owner-death supervisor and _wait_for_process releases it.
