@@ -833,9 +833,6 @@ def _read_terminal_shell_init_config() -> tuple[list[str], bool]:
         return [], True
 
 
-_TASKPOLICY = "/usr/sbin/taskpolicy"
-
-
 def process_priority_prefix() -> list[str]:
     """argv prefix that runs a host terminal command below Hermes' own CPU priority when
     ``terminal.process_priority: low``, so a CPU-bound command (``make -j``, a test swarm) cannot
@@ -845,17 +842,19 @@ def process_priority_prefix() -> list[str]:
     ignores nice, so it gets the ``utility`` QoS clamp instead. No-op on Windows."""
     from hermes_cli.config import load_config_readonly
     from hermes_cli.config_home import HomeInitializationError
+    from hermes_platform.host.facts import os_family
+    from hermes_platform.resolver import locate_command
     try:  # an unavailable home (unmounted, unreadable) must not break every terminal command
         terminal_cfg = load_config_readonly().get("terminal")
     except HomeInitializationError:
         return []
     level = terminal_cfg.get("process_priority") if isinstance(terminal_cfg, dict) else None
-    if str(level or "").strip().lower() != "low" or _IS_WINDOWS:
+    if str(level or "").strip().lower() != "low" or os_family() == "win32":
         return []
-    if sys.platform == "darwin" and os.path.exists(_TASKPOLICY):
-        return [_TASKPOLICY, "-c", "utility"]
-    nice = shutil.which("nice")
-    return [nice, "-n", "10"] if nice else []
+    if os_family() == "darwin" and (taskpolicy := locate_command("/usr/sbin/taskpolicy").command):
+        return [*taskpolicy, "-c", "utility"]
+    nice = locate_command("nice").command
+    return [*nice, "-n", "10"] if nice else []
 
 
 def _resolve_shell_init_files() -> list[str]:
