@@ -504,6 +504,11 @@
     "kind": "bare_which"
   },
   {
+    "path": "tools/environments/local.py",
+    "symbol": "process_priority_prefix",
+    "kind": "bare_which"
+  },
+  {
     "path": "tools/environments/ssh.py",
     "symbol": "_ensure_ssh_available",
     "kind": "bare_which"

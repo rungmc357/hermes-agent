@@ -844,7 +844,11 @@ def process_priority_prefix() -> list[str]:
     ``exec``); niceness and the clamp are inherited by everything the shell starts. macOS largely
     ignores nice, so it gets the ``utility`` QoS clamp instead. No-op on Windows."""
     from hermes_cli.config import load_config_readonly
-    terminal_cfg = load_config_readonly().get("terminal")
+    from hermes_cli.config_home import HomeInitializationError
+    try:  # an unavailable home (unmounted, unreadable) must not break every terminal command
+        terminal_cfg = load_config_readonly().get("terminal")
+    except HomeInitializationError:
+        return []
     level = terminal_cfg.get("process_priority") if isinstance(terminal_cfg, dict) else None
     if str(level or "").strip().lower() != "low" or _IS_WINDOWS:
         return []
