@@ -189,6 +189,9 @@ def spawn_background_process(
             result_data["approval"] = approval_note
         if pty_disabled_reason:
             result_data["pty_note"] = pty_disabled_reason
+        from tools.terminal_tool_result import _local_host_pressure_note
+        if pressure_note := _local_host_pressure_note(env_type):
+            result_data["host_pressure"] = pressure_note
         if auto_backgrounded:
             result_data["auto_backgrounded"] = _AUTO_BACKGROUND_NOTE
         elif not notify_on_complete and not watch_patterns:

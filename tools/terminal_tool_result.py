@@ -204,6 +204,16 @@ def _verification_evidence(command, cwd, session_id, returncode, output, pipelin
     return None
 
 
+def _local_host_pressure_note(env_type: str) -> Optional[str]:
+    """Only the local backend runs on the host whose load/disk Hermes can see and starve on."""
+    if env_type != "local":
+        return None
+    from tools.host_pressure import host_pressure_note
+    with _quiet("host pressure probe"):
+        return host_pressure_note()
+    return None
+
+
 def finalize_foreground_result(
     *, command: str, result: dict, env: Any, env_type: str, effective_task_id: str,
     task_id: Optional[str], session_id: Optional[str], session_key: str,
@@ -271,6 +281,7 @@ def finalize_foreground_result(
         ("hint", failure_hint or None),
         ("sudo_auth_failed", True if sudo_auth_failed else None),
         ("sudo_cache_cleared", True if sudo_cache_cleared else None),
+        ("host_pressure", _local_host_pressure_note(env_type)),
     ]
     for key, value in optional_fields:
         if value is not None:

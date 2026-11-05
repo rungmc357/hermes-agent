@@ -28,6 +28,7 @@ from tools.environments.local_env_policy import (
     _home_adapter_secret_env, _matches_terminal_first_party_prefix, _plugin_terminal_env_strip_keys,
     _registered_adapter_secret_env, _registry_adapter_secret_env,
     strip_profile_gate_env, strip_supervised_process_identity)
+from tools.environments.local_priority import process_priority_prefix
 from tools.environments.local_pythonpath import (
     _build_hermes_repo_root_aliases, _strip_hermes_owned_pythonpath_and_runtime_markers)
 
@@ -831,30 +832,6 @@ def _read_terminal_shell_init_config() -> tuple[list[str], bool]:
         return [str(f) for f in files if f], bool(terminal_cfg.get("auto_source_bashrc", True))
     except Exception:
         return [], True
-
-
-def process_priority_prefix() -> list[str]:
-    """argv prefix that runs a host terminal command below Hermes' own CPU priority when
-    ``terminal.process_priority: low``, so a CPU-bound command (``make -j``, a test swarm) cannot
-    starve the gateway/serve loop that answers every profile. An argv prefix rather than a
-    ``preexec_fn`` (unsafe in the threaded gateway; a macOS QoS clamp set there does not survive
-    ``exec``); niceness and the clamp are inherited by everything the shell starts. macOS largely
-    ignores nice, so it gets the ``utility`` QoS clamp instead. No-op on Windows."""
-    from hermes_cli.config import load_config_readonly
-    from hermes_cli.config_home import HomeInitializationError
-    from hermes_platform.host.facts import os_family
-    from hermes_platform.resolver import locate_command
-    try:  # an unavailable home (unmounted, unreadable) must not break every terminal command
-        terminal_cfg = load_config_readonly().get("terminal")
-    except HomeInitializationError:
-        return []
-    level = terminal_cfg.get("process_priority") if isinstance(terminal_cfg, dict) else None
-    if str(level or "").strip().lower() != "low" or os_family() == "win32":
-        return []
-    if os_family() == "darwin" and (taskpolicy := locate_command("/usr/sbin/taskpolicy").command):
-        return [*taskpolicy, "-c", "utility"]
-    nice = locate_command("nice").command
-    return [*nice, "-n", "10"] if nice else []
 
 
 def _resolve_shell_init_files() -> list[str]:

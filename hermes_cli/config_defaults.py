@@ -331,7 +331,7 @@ DEFAULT_CONFIG = {
         # go first because n/nvm/asdf write PATH exports there without an interactivity guard. Turn
         # off if an rc file misbehaves when sourced non-interactively (exits on TTY check).
         "auto_source_bashrc": True,
-        "process_priority": "normal",  # "low" = local terminal commands run below Hermes' CPU priority (nice 10 / macOS utility QoS)
+        "process_priority": "normal",  # low | background: local terminal/execute_code children run below Hermes (see docs)
         # The default sandbox for every container backend: the nikolaik/python-nodejs base
         # (Python 3.13 / Node 26) plus a display stack, so Bot Screen, computer_use and the
         # bot's browser run INSIDE the sandbox and the pane can watch them (see bot_desktop).
